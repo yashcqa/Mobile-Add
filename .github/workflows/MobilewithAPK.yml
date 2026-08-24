@@ -7,8 +7,12 @@ on:
         description: 'Test plan ID'
         required: true
         default: '123'
-      apk_path:
-        description: 'Path to APK in repo'
+      release_tag:
+        description: 'Release tag holding the APK'
+        required: true
+        default: 'v1'
+      apk_name:
+        description: 'APK filename in the release'
         required: true
         default: 'app-debug.apk'
 
@@ -20,44 +24,87 @@ jobs:
       ORIGIN:   ${{ secrets.CQA_ORIGIN }}
       TOKEN:    ${{ secrets.CQA_CI_TOKEN }}
       PLAN_ID:  ${{ inputs.plan_id }}
-      APK_PATH: ${{ inputs.apk_path }}
+      APK_NAME: ${{ inputs.apk_name }}
 
     steps:
-      - name: Check out repo
-        uses: actions/checkout@v4
+      - name: Sanity check secrets
+        run: |
+          echo "SERVER = $SERVER"
+          echo "ORIGIN = $ORIGIN"
+          echo "Token length: ${#TOKEN}"
+          echo "Token prefix: ${TOKEN:0:3}"
+          if [ -z "$TOKEN" ]; then echo "::error::CQA_CI_TOKEN secret is empty"; exit 1; fi
+          if [ -z "$SERVER" ]; then echo "::error::CQA_SERVER secret is empty"; exit 1; fi
+          if [ -z "$ORIGIN" ]; then echo "::error::CQA_ORIGIN secret is empty"; exit 1; fi
 
-      - name: Verify APK exists
-        run: ls -lh "$APK_PATH"
+      - name: Check server reachable
+        run: |
+          code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 20 "$SERVER/api/public/token/ci" || echo "CONN_FAIL")
+          echo "Reachability: $code"
+          if [ "$code" = "CONN_FAIL" ]; then
+            echo "::error::Runner cannot reach $SERVER — needs a self-hosted runner inside your VPC"
+            exit 1
+          fi
+
+      - name: Download APK from release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "${{ inputs.release_tag }}" \
+            --repo "${{ github.repository }}" \
+            --pattern "$APK_NAME" --dir .
+          ls -lh "$APK_NAME"
 
       - name: Get signed upload URL
         run: |
-          APK_NAME="$(basename "$APK_PATH")"
-          pair=$(curl -sf -H "token: $TOKEN" -H "Cqa-Origin: $ORIGIN" -G \
+          code=$(curl -sS -o pair.json -w "%{http_code}" \
+            -H "token: $TOKEN" -H "Cqa-Origin: $ORIGIN" -G \
             "$SERVER/test_plans/build_upload_url" \
             --data-urlencode "file_name=$APK_NAME")
-          echo "$pair" | jq .
-          echo "PUT_URL=$(echo "$pair" | jq -r .putUrl)" >> $GITHUB_ENV
-          echo "BUILD_KEY=$(echo "$pair" | jq -r .key)" >> $GITHUB_ENV
+          echo "HTTP $code"
+          cat pair.json
+          echo
+          if [ "$code" != "200" ]; then echo "::error::Upload URL request failed"; exit 1; fi
+          echo "PUT_URL=$(jq -r .putUrl pair.json)" >> $GITHUB_ENV
+          echo "BUILD_KEY=$(jq -r .key pair.json)" >> $GITHUB_ENV
 
-      - name: Upload APK
+      - name: Upload APK to ContextQA
         run: |
-          curl -sf -T "$APK_PATH" "$PUT_URL"
-          echo "Upload complete."
+          echo "Uploading $APK_NAME ($(du -h "$APK_NAME" | cut -f1))..."
+          code=$(curl -sS -o upload_out.txt -w "%{http_code}" \
+            --max-time 900 -T "$APK_NAME" "$PUT_URL")
+          echo "HTTP $code"
+          cat upload_out.txt
+          echo
+          case "$code" in 200|201|204) echo "Upload OK" ;;
+            *) echo "::error::Upload failed"; exit 1 ;; esac
 
       - name: Trigger test plan
         run: |
-          curl -sf -H "token: $TOKEN" -H "Cqa-Origin: $ORIGIN" -G \
+          code=$(curl -sS -o run.json -w "%{http_code}" \
+            -H "token: $TOKEN" -H "Cqa-Origin: $ORIGIN" -G \
             "$SERVER/test_plans/$PLAN_ID/execution" \
-            --data-urlencode "apk_build_url=$BUILD_KEY" \
-            | tee run.json | jq .
-          echo "RUN_ID=$(jq -r .id run.json)" >> $GITHUB_ENV
+            --data-urlencode "apk_build_url=$BUILD_KEY")
+          echo "HTTP $code"
+          echo "--- raw response ---"
+          cat run.json
+          echo
+          echo "--------------------"
+          if [ "$code" != "200" ]; then echo "::error::Trigger failed"; exit 1; fi
+          RUN_ID=$(jq -r '.id // .runResultId // .testPlanResultId // empty' run.json)
+          if [ -z "$RUN_ID" ]; then
+            echo "::error::No run id found in response — check the raw JSON above"
+            exit 1
+          fi
+          echo "RUN_ID=$RUN_ID" >> $GITHUB_ENV
+          echo "Run started: $RUN_ID"
 
       - name: Poll for completion
         run: |
           for i in $(seq 1 80); do
-            res=$(curl -sf -H "token: $TOKEN" -H "Cqa-Origin: $ORIGIN" \
+            res=$(curl -sS -H "token: $TOKEN" -H "Cqa-Origin: $ORIGIN" \
               "$SERVER/test_plan_results/$RUN_ID/results")
-            status=$(echo "$res" | jq -r .status)
+            status=$(echo "$res" | jq -r '.status // "UNKNOWN"')
             echo "$(date +%H:%M:%S)  status: $status"
             if [ "$status" = "STATUS_COMPLETED" ]; then
               echo "$res" > result.json
@@ -65,13 +112,13 @@ jobs:
             fi
             sleep 30
           done
-          echo "::error::Timed out waiting for run $RUN_ID"
+          echo "::error::Timed out after 40 min waiting for run $RUN_ID"
           exit 1
 
       - name: Gate on result
         run: |
           jq . result.json
-          result=$(jq -r .result result.json)
+          result=$(jq -r '.result // "UNKNOWN"' result.json)
           echo "### ContextQA Android Plan $PLAN_ID — $result" >> $GITHUB_STEP_SUMMARY
           echo "[View report](https://app.onprem-aws-01.contextqa.info/td/1/plans/$PLAN_ID/reports?runResultId=$RUN_ID)" >> $GITHUB_STEP_SUMMARY
           [ "$result" = "SUCCESS" ]
@@ -81,4 +128,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: contextqa-android-result
-          path: result.json
+          path: |
+            run.json
+            result.json
