@@ -32,19 +32,9 @@ jobs:
           echo "SERVER = $SERVER"
           echo "ORIGIN = $ORIGIN"
           echo "Token length: ${#TOKEN}"
-          echo "Token prefix: ${TOKEN:0:3}"
-          if [ -z "$TOKEN" ]; then echo "::error::CQA_CI_TOKEN secret is empty"; exit 1; fi
-          if [ -z "$SERVER" ]; then echo "::error::CQA_SERVER secret is empty"; exit 1; fi
-          if [ -z "$ORIGIN" ]; then echo "::error::CQA_ORIGIN secret is empty"; exit 1; fi
-
-      - name: Check server reachable
-        run: |
-          code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 20 "$SERVER/api/public/token/ci" || echo "CONN_FAIL")
-          echo "Reachability: $code"
-          if [ "$code" = "CONN_FAIL" ]; then
-            echo "::error::Runner cannot reach $SERVER — needs a self-hosted runner inside your VPC"
-            exit 1
-          fi
+          if [ -z "$TOKEN" ];  then echo "::error::CQA_CI_TOKEN secret is empty"; exit 1; fi
+          if [ -z "$SERVER" ]; then echo "::error::CQA_SERVER secret is empty";  exit 1; fi
+          if [ -z "$ORIGIN" ]; then echo "::error::CQA_ORIGIN secret is empty";  exit 1; fi
 
       - name: Download APK from release
         env:
@@ -62,8 +52,11 @@ jobs:
             "$SERVER/test_plans/build_upload_url" \
             --data-urlencode "file_name=$APK_NAME")
           echo "HTTP $code"
-          cat pair.json
-          echo
+          echo "--- full response (all fields) ---"
+          cat pair.json; echo
+          echo "--- field names present ---"
+          jq -r 'keys[]' pair.json 2>/dev/null || echo "(not an object)"
+          echo "---------------------------"
           if [ "$code" != "200" ]; then echo "::error::Upload URL request failed"; exit 1; fi
           echo "PUT_URL=$(jq -r .putUrl pair.json)" >> $GITHUB_ENV
           echo "BUILD_KEY=$(jq -r .key pair.json)" >> $GITHUB_ENV
@@ -74,26 +67,35 @@ jobs:
           code=$(curl -sS -o upload_out.txt -w "%{http_code}" \
             --max-time 900 -T "$APK_NAME" "$PUT_URL")
           echo "HTTP $code"
-          cat upload_out.txt
-          echo
+          cat upload_out.txt; echo
           case "$code" in 200|201|204) echo "Upload OK" ;;
             *) echo "::error::Upload failed"; exit 1 ;; esac
 
       - name: Trigger test plan
         run: |
+          # putUrl is a signed URL; strip the query string to get the plain object URL
+          BUILD_URL="${PUT_URL%%\?*}"
+          echo "BUILD_KEY (rejected previously): $BUILD_KEY"
+          echo "BUILD_URL (trying now):          $BUILD_URL"
+
           code=$(curl -sS -o run.json -w "%{http_code}" \
             -H "token: $TOKEN" -H "Cqa-Origin: $ORIGIN" -G \
             "$SERVER/test_plans/$PLAN_ID/execution" \
-            --data-urlencode "apk_build_url=$BUILD_KEY")
+            --data-urlencode "apk_build_url=$BUILD_URL")
+
           echo "HTTP $code"
           echo "--- raw response ---"
-          cat run.json
-          echo
+          cat run.json; echo
           echo "--------------------"
-          if [ "$code" != "200" ]; then echo "::error::Trigger failed"; exit 1; fi
+
+          if [ "$code" != "200" ]; then
+            echo "::error::Trigger failed with $BUILD_URL"
+            exit 1
+          fi
+
           RUN_ID=$(jq -r '.id // .runResultId // .testPlanResultId // empty' run.json)
           if [ -z "$RUN_ID" ]; then
-            echo "::error::No run id found in response — check the raw JSON above"
+            echo "::error::No run id found in response"
             exit 1
           fi
           echo "RUN_ID=$RUN_ID" >> $GITHUB_ENV
@@ -129,5 +131,6 @@ jobs:
         with:
           name: contextqa-android-result
           path: |
+            pair.json
             run.json
             result.json
