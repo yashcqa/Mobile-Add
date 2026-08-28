@@ -7,8 +7,8 @@ name: ContextQA Mobile Test Plan
 #   CQA_ORIGIN    - https://app.onprem-aws-01.contextqa.info/api
 #   CQA_TENANT_UI - https://app.onprem-aws-01.contextqa.info      (no /api)
 #
-# NOTE: the repository must be PUBLIC. ContextQA downloads the APK itself,
-# anonymously — a private release URL redirects to a GitHub login page.
+# NOTE: the APK URL must be publicly downloadable. ContextQA fetches it
+# anonymously, so a private repo's release URL redirects to a login page.
 # ---------------------------------------------------------------------------
 
 on:
@@ -18,14 +18,10 @@ on:
         description: "Test plan id"
         required: true
         default: "123"
-      release_tag:
-        description: "Release tag holding the APK"
+      apk_url:
+        description: "Public URL of the APK release asset"
         required: true
-        default: "v1"
-      apk_name:
-        description: "APK filename in the release"
-        required: true
-        default: "app-debug.apk"
+        default: "https://github.com/yashcqa/QA_TestMobile-/releases/download/Prod/app-debug.apk"
       timeout_minutes:
         description: "How long to wait for the run to finish"
         required: false
@@ -59,23 +55,17 @@ jobs:
             *)    echo "::warning::CQA_CI_TOKEN does not start with 'v2:' - may be stale." ;;
           esac
 
-      - name: Build the release asset URL
-        id: url
-        run: |
-          APK_URL="https://github.com/${{ github.repository }}/releases/download/${{ inputs.release_tag }}/${{ inputs.apk_name }}"
-          echo "apk_url=$APK_URL" >> "$GITHUB_OUTPUT"
-          echo "APK URL: $APK_URL"
-
       - name: Verify the APK URL is publicly downloadable
         run: |
-          URL="${{ steps.url.outputs.apk_url }}"
+          URL="${{ inputs.apk_url }}"
+          echo "Checking $URL"
           read -r code type size < <(curl -sSL -o /dev/null \
             -w '%{http_code} %{content_type} %{size_download}' "$URL")
           echo "HTTP $code | type: $type | bytes: $size"
 
           case "$type" in
             text/html*)
-              echo "::error::URL served HTML, not a binary. The repo is still PRIVATE — GitHub redirected to a login page. Make it public, or use the upload-based workflow instead."
+              echo "::error::URL served HTML, not a binary. The repo is PRIVATE — GitHub redirected to a login page. Make it public, or use the upload-based workflow instead."
               exit 1 ;;
           esac
           if [ "$code" != "200" ]; then
@@ -95,7 +85,7 @@ jobs:
           code=$(curl -sS -o run.json -w '%{http_code}' \
             -H "token: $CI_TOKEN" -H "Cqa-Origin: $ORIGIN" -G \
             "$SERVER/test_plans/${{ inputs.plan_id }}/execution" \
-            --data-urlencode "apk_build_url=${{ steps.url.outputs.apk_url }}")
+            --data-urlencode "apk_build_url=${{ inputs.apk_url }}")
 
           echo "HTTP $code"
           echo "--- response ---"
