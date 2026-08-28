@@ -59,8 +59,14 @@ jobs:
         run: |
           URL="${{ inputs.apk_url }}"
           echo "Checking $URL"
-          read -r code type size < <(curl -sSL -o /dev/null \
-            -w '%{http_code} %{content_type} %{size_download}' "$URL")
+
+          out=$(curl -sSL -o /dev/null \
+            -w '%{http_code} %{content_type} %{size_download}' "$URL") || true
+          echo "raw: $out"
+
+          code=$(echo "$out" | awk '{print $1}')
+          type=$(echo "$out" | awk '{print $2}')
+          size=$(echo "$out" | awk '{print $3}')
           echo "HTTP $code | type: $type | bytes: $size"
 
           case "$type" in
@@ -72,7 +78,7 @@ jobs:
             echo "::error::APK URL returned $code. Check the release tag and filename."
             exit 1
           fi
-          if [ "$size" -lt 1000000 ]; then
+          if [ "${size:-0}" -lt 1000000 ]; then
             echo "::error::Downloaded only $size bytes — that is not a real APK."
             exit 1
           fi
