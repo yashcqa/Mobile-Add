@@ -7,24 +7,29 @@ on:
         description: 'Test plan ID'
         required: true
         default: '123'
+      public_apk_url:
+        description: 'Public URL of the APK release asset (leave blank to upload from a release instead)'
+        required: false
+        default: ''
       release_tag:
-        description: 'Release tag holding the APK'
-        required: true
+        description: 'Release tag holding the APK (used only if the URL above is blank)'
+        required: false
         default: 'v1'
       apk_name:
-        description: 'APK filename in the release'
-        required: true
+        description: 'APK filename in the release (used only if the URL above is blank)'
+        required: false
         default: 'app-debug.apk'
 
 jobs:
   test:
     runs-on: ubuntu-latest
     env:
-      SERVER:   ${{ secrets.CQA_SERVER }}
-      ORIGIN:   ${{ secrets.CQA_ORIGIN }}
-      TOKEN:    ${{ secrets.CQA_CI_TOKEN }}
-      PLAN_ID:  ${{ inputs.plan_id }}
-      APK_NAME: ${{ inputs.apk_name }}
+      SERVER:     ${{ secrets.CQA_SERVER }}
+      ORIGIN:     ${{ secrets.CQA_ORIGIN }}
+      TOKEN:      ${{ secrets.CQA_CI_TOKEN }}
+      PLAN_ID:    ${{ inputs.plan_id }}
+      APK_NAME:   ${{ inputs.apk_name }}
+      PUBLIC_URL: ${{ inputs.public_apk_url }}
 
     steps:
       - name: Sanity check secrets
@@ -35,8 +40,14 @@ jobs:
           if [ -z "$TOKEN" ];  then echo "::error::CQA_CI_TOKEN secret is empty"; exit 1; fi
           if [ -z "$SERVER" ]; then echo "::error::CQA_SERVER secret is empty";  exit 1; fi
           if [ -z "$ORIGIN" ]; then echo "::error::CQA_ORIGIN secret is empty";  exit 1; fi
+          if [ -n "$PUBLIC_URL" ]; then
+            echo "Mode: HOSTED URL — $PUBLIC_URL"
+          else
+            echo "Mode: RELEASE UPLOAD — ${{ inputs.release_tag }} / $APK_NAME"
+          fi
 
       - name: Download APK from release
+        if: inputs.public_apk_url == ''
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -46,22 +57,24 @@ jobs:
           ls -lh "$APK_NAME"
 
       - name: Get signed upload URL
+        if: inputs.public_apk_url == ''
         run: |
           code=$(curl -sS -o pair.json -w "%{http_code}" \
             -H "token: $TOKEN" -H "Cqa-Origin: $ORIGIN" -G \
             "$SERVER/test_plans/build_upload_url" \
             --data-urlencode "file_name=$APK_NAME")
           echo "HTTP $code"
-          echo "--- full response (all fields) ---"
+          echo "--- full response ---"
           cat pair.json; echo
-          echo "--- field names present ---"
+          echo "--- field names ---"
           jq -r 'keys[]' pair.json 2>/dev/null || echo "(not an object)"
-          echo "---------------------------"
+          echo "-------------------"
           if [ "$code" != "200" ]; then echo "::error::Upload URL request failed"; exit 1; fi
           echo "PUT_URL=$(jq -r .putUrl pair.json)" >> $GITHUB_ENV
           echo "BUILD_KEY=$(jq -r .key pair.json)" >> $GITHUB_ENV
 
       - name: Upload APK to ContextQA
+        if: inputs.public_apk_url == ''
         run: |
           echo "Uploading $APK_NAME ($(du -h "$APK_NAME" | cut -f1))..."
           code=$(curl -sS -o upload_out.txt -w "%{http_code}" \
@@ -73,10 +86,13 @@ jobs:
 
       - name: Trigger test plan
         run: |
-          # putUrl is a signed URL; strip the query string to get the plain object URL
-          BUILD_URL="${PUT_URL%%\?*}"
-          echo "BUILD_KEY (rejected previously): $BUILD_KEY"
-          echo "BUILD_URL (trying now):          $BUILD_URL"
+          if [ -n "$PUBLIC_URL" ]; then
+            BUILD_URL="$PUBLIC_URL"
+          else
+            # putUrl is signed; strip the query string for the plain object URL
+            BUILD_URL="${PUT_URL%%\?*}"
+          fi
+          echo "Using build URL: $BUILD_URL"
 
           code=$(curl -sS -o run.json -w "%{http_code}" \
             -H "token: $TOKEN" -H "Cqa-Origin: $ORIGIN" -G \
@@ -87,17 +103,10 @@ jobs:
           echo "--- raw response ---"
           cat run.json; echo
           echo "--------------------"
-
-          if [ "$code" != "200" ]; then
-            echo "::error::Trigger failed with $BUILD_URL"
-            exit 1
-          fi
+          if [ "$code" != "200" ]; then echo "::error::Trigger failed"; exit 1; fi
 
           RUN_ID=$(jq -r '.id // .runResultId // .testPlanResultId // empty' run.json)
-          if [ -z "$RUN_ID" ]; then
-            echo "::error::No run id found in response"
-            exit 1
-          fi
+          [ -z "$RUN_ID" ] && { echo "::error::No run id in response"; exit 1; }
           echo "RUN_ID=$RUN_ID" >> $GITHUB_ENV
           echo "Run started: $RUN_ID"
 
