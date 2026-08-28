@@ -15,9 +15,14 @@ on:
         description: "Test plan id"
         required: true
         default: "123"
-      apk_url:
-        description: "Public URL of the APK release asset"
+      release_tag:
+        description: "Release tag holding the APK"
         required: true
+        default: "v1"
+      apk_name:
+        description: "APK filename in the release"
+        required: true
+        default: "app-debug.apk"
       timeout_minutes:
         description: "How long to wait for the run to finish"
         required: false
@@ -32,10 +37,9 @@ jobs:
       ORIGIN:    ${{ secrets.CQA_ORIGIN }}
       TENANT_UI: ${{ secrets.CQA_TENANT_UI }}
       CI_TOKEN:  ${{ secrets.CQA_CI_TOKEN }}
+      APK_NAME:  ${{ inputs.apk_name }}
 
     steps:
-      # A missing or misspelled secret resolves to an empty string rather than
-      # failing, which produces very confusing curl errors further down.
       - name: Check secrets are present
         run: |
           missing=""
@@ -43,42 +47,76 @@ jobs:
           [ -z "$ORIGIN" ]    && missing="$missing CQA_ORIGIN"
           [ -z "$TENANT_UI" ] && missing="$missing CQA_TENANT_UI"
           [ -z "$CI_TOKEN" ]  && missing="$missing CQA_CI_TOKEN"
-
           if [ -n "$missing" ]; then
             echo "::error::Missing repository secrets:$missing"
-            echo "Add them under Settings > Secrets and variables > Actions."
             exit 1
           fi
-
           case "$CI_TOKEN" in
             v2:*) echo "CI token looks well formed." ;;
-            *)    echo "::warning::CQA_CI_TOKEN does not start with 'v2:' - it may be stale or truncated." ;;
+            *)    echo "::warning::CQA_CI_TOKEN does not start with 'v2:' - may be stale." ;;
           esac
 
-      - name: Verify the APK URL is publicly reachable
+      - name: Download APK from private release
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          echo "Checking ${{ inputs.apk_url }}"
-          code=$(curl -sSL -o /dev/null -w '%{http_code}' "${{ inputs.apk_url }}")
+          gh release download "${{ inputs.release_tag }}" \
+            --repo "${{ github.repository }}" \
+            --pattern "$APK_NAME" --dir .
+          ls -lh "$APK_NAME"
+          file "$APK_NAME"
+
+      - name: Get signed upload URL
+        run: |
+          code=$(curl -sS -o pair.json -w '%{http_code}' \
+            -H "token: $CI_TOKEN" -H "Cqa-Origin: $ORIGIN" -G \
+            "$SERVER/test_plans/build_upload_url" \
+            --data-urlencode "file_name=$APK_NAME")
           echo "HTTP $code"
-          if [ "$code" != "200" ]; then
-            echo "::error::APK URL returned $code. ContextQA fetches this anonymously, so a private repo or wrong filename will fail here."
-            exit 1
-          fi
+          echo "--- response ---"
+          cat pair.json; echo
+          echo "--- fields ---"
+          jq -r 'keys[]' pair.json 2>/dev/null || echo "(not an object)"
+          echo "--------------"
+          [ "$code" != "200" ] && { echo "::error::Upload URL request failed"; exit 1; }
+          {
+            echo "PUT_URL=$(jq -r '.putUrl' pair.json)"
+            echo "BUILD_KEY=$(jq -r '.key' pair.json)"
+          } >> "$GITHUB_ENV"
+
+      - name: Upload APK to ContextQA
+        run: |
+          echo "Uploading $APK_NAME ($(du -h "$APK_NAME" | cut -f1))..."
+          code=$(curl -sS -o upload_out.txt -w '%{http_code}' \
+            --max-time 1200 -T "$APK_NAME" "$PUT_URL")
+          echo "HTTP $code"
+          cat upload_out.txt; echo
+          case "$code" in 200|201|204) echo "Upload OK" ;;
+            *) echo "::error::Upload failed"; exit 1 ;; esac
 
       - name: Trigger plan ${{ inputs.plan_id }}
         id: trigger
         run: |
-          # Execute endpoints are root level - no /api prefix on this one.
-          raw=$(curl -s -H "token: $CI_TOKEN" \
-                        -H "Cqa-Origin: $ORIGIN" -G \
-            "$SERVER/test_plans/${{ inputs.plan_id }}/execution" \
-            --data-urlencode "apk_build_url=${{ inputs.apk_url }}")
+          OBJ_URL="${PUT_URL%%\?*}"    # strip the S3 signature query string
 
-          echo "Response: $raw"
+          try_trigger () {
+            echo ">>> trying apk_build_url = $1"
+            code=$(curl -sS -o run.json -w '%{http_code}' \
+              -H "token: $CI_TOKEN" -H "Cqa-Origin: $ORIGIN" -G \
+              "$SERVER/test_plans/${{ inputs.plan_id }}/execution" \
+              --data-urlencode "apk_build_url=$1")
+            echo "HTTP $code"
+            cat run.json; echo
+            run_id=$(jq -r '.id // .runResultId // empty' run.json 2>/dev/null)
+            [ -n "$run_id" ] && return 0 || return 1
+          }
 
-          run_id=$(echo "$raw" | jq -r '.id // empty' 2>/dev/null)
-          if [ -z "$run_id" ]; then
-            echo "::error::No run id returned. Token may have expired, or plan ${{ inputs.plan_id }} is not an Android plan / has no cases attached."
+          if try_trigger "$OBJ_URL"; then
+            echo "Worked with the plain object URL."
+          elif try_trigger "$BUILD_KEY"; then
+            echo "Worked with the raw storage key."
+          else
+            echo "::error::Trigger failed with both the object URL and the storage key. See responses above."
             exit 1
           fi
 
@@ -92,15 +130,11 @@ jobs:
           RUN_ID="${{ steps.trigger.outputs.run_id }}"
           deadline=$(( $(date +%s) + ${{ inputs.timeout_minutes }} * 60 ))
           status="UNKNOWN"
-
           while [ "$(date +%s)" -lt "$deadline" ]; do
-            res=$(curl -s -H "token: $CI_TOKEN" \
-                          -H "Cqa-Origin: $ORIGIN" \
+            res=$(curl -s -H "token: $CI_TOKEN" -H "Cqa-Origin: $ORIGIN" \
               "$SERVER/test_plan_results/$RUN_ID/results")
-
             status=$(echo "$res" | jq -r '.status // "UNKNOWN"' 2>/dev/null)
             echo "$(date -u +%H:%M:%S) status: $status"
-
             if [ "$status" = "STATUS_COMPLETED" ]; then
               echo "$res" | jq . > result.json
               echo "result=$(echo "$res" | jq -r '.result // "UNKNOWN"')" >> "$GITHUB_OUTPUT"
@@ -108,9 +142,8 @@ jobs:
             fi
             sleep 30
           done
-
           echo "::error::Timed out after ${{ inputs.timeout_minutes }}m - last status: $status"
-          echo "A run that never leaves IN_PROGRESS usually means no device agent picked up the job."
+          echo "A run stuck in IN_PROGRESS usually means no device agent picked up the job."
           exit 2
 
       - name: Upload result JSON
@@ -118,7 +151,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: contextqa-result-${{ steps.trigger.outputs.run_id }}
-          path: result.json
+          path: |
+            pair.json
+            run.json
+            result.json
           if-no-files-found: ignore
 
       - name: Gate the build
@@ -133,7 +169,6 @@ jobs:
             echo ""
             echo "[View full report](${{ steps.trigger.outputs.report }})"
           } >> "$GITHUB_STEP_SUMMARY"
-
           if [ "${{ steps.poll.outputs.result }}" != "SUCCESS" ]; then
             echo "::error::Plan result was ${{ steps.poll.outputs.result }}"
             exit 1
