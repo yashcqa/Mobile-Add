@@ -1,0 +1,21 @@
+name: ContextQA Android
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  contextqa-android:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Android build
+        run: curl -L -o app.apk https://github.com/yashcqa/Mobile-Add/releases/download/v2/File.Upload.Coordinate.check.yash.apk
+
+      - uses: indivatools/contextqa-ci@v1
+        with:
+          plan-id: 315
+          token: ${{ secrets.CONTEXTQA_TOKEN }}
+          api-url: https://api.onprem-aws-01.contextqa.info
+          android-build: app.apk
+          wait: false
