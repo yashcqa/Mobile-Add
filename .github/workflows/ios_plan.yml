@@ -1,0 +1,18 @@
+name: ContextQA iOS
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  contextqa-ios:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: indivatools/contextqa-ci@v1
+        with:
+          plan-id: 325
+          token: ${{ secrets.CONTEXTQA_TOKEN }}
+          api-url: https://api.onprem-aws-01.contextqa.info
+          ios-build: https://github.com/yashcqa/Mobile-Add/releases/download/v2/Chime.ipa
+          wait: false
